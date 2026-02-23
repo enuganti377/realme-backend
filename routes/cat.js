@@ -25,5 +25,20 @@ router.get("/", async (req, res) => {
   }
 });
 
+router.get("/news/:id", async (req, res) => {
+  try {
+    const news = await News.findById(req.params.id);
+
+    if (!news) {
+      return res.status(404).json({ message: "News not found" });
+    }
+
+    res.json(news);
+  } catch (err) {
+    console.log("Single news error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
 module.exports = router;
 

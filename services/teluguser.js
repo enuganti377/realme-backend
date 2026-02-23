@@ -1,200 +1,151 @@
 const axios = require("axios");
 const xml2js = require("xml2js");
-const cheerio = require("cheerio");
 const News = require("../models/News");
 
-const rssMap = {
-  general: "https://telugu.abplive.com/home/feed",
-  politics: "https://telugu.abplive.com/politics/feed",
-  sports: "https://telugu.abplive.com/sports/feed",
-  cinema: "https://telugu.abplive.com/entertainment/feed",
-};
+const { detectFromURL } = require("../utils/categoryDetector");
+const { detectFromMetaAndBreadcrumb } = require("../utils/metaCategoryDetector");
+
+const DEFAULT_IMAGE =
+  "https://via.placeholder.com/300x200?text=News";
+
+const rssFeeds = [
+  { url: "https://telugu.abplive.com/home/feed", defaultCategory: "general" },
+  { url: "https://telugu.abplive.com/politics/feed", defaultCategory: "politics" },
+  { url: "https://telugu.abplive.com/sports/feed", defaultCategory: "sports" },
+  { url: "https://telugu.abplive.com/entertainment/feed", defaultCategory: "cinema" },
+];
 
 
+function createSnippet(html = "", maxWords = 25) {
 
-// Decode HTML entities
-function decodeHtml(text = "") {
-  return text
+ 
+  html = html
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&amp;/g, "&")
-    .replace(/&nbsp;/g, " ");
-}
+    .replace(/&#39;/g, "'");
 
-
-
-// Clean + limit words
-function cleanText(html = "", maxWords = 350) {
-  let text = decodeHtml(html);
-
-  text = text.replace(/<[^>]*>/g, " ");
-  text = text.replace(/\s+/g, " ").trim();
+ 
+  const text = html
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
   const words = text.split(" ");
-  if (words.length > maxWords) {
-    text = words.slice(0, maxWords).join(" ");
-  }
 
-  return text;
+  return words.length > maxWords
+    ? words.slice(0, maxWords).join(" ") + "..."
+    : text;
 }
 
 
+function extractImage(item) {
 
-// 🔥 Strong full article extractor
-async function extractFullArticle(url) {
-  try {
-    const { data } = await axios.get(url, {
-      timeout: 12000,
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-      },
-    });
+  if (item?.content?.$?.url) return item.content.$.url;
+  if (item?.["media:content"]?.$?.url) return item["media:content"].$.url;
+  if (item?.thumbnail?.$?.url) return item.thumbnail.$.url;
+  if (item?.["media:thumbnail"]?.$?.url)
+    return item["media:thumbnail"].$.url;
+  if (item?.enclosure?.$?.url) return item.enclosure.$.url;
 
-    const $ = cheerio.load(data);
+  if (item?.description) {
+    const match = item.description.match(
+      /<img[^>]+src=['"]([^'"]+)['"]/i
+    );
+    if (match) return match[1];
+  }
 
-    let text = "";
+  return DEFAULT_IMAGE;
+}
 
-    // Try multiple containers
-    const selectors = [
-      ".article-content p",
-      ".story-content p",
-      ".abp-story-article p",
-      "article p",
-      ".content p",
-      ".storyBody p",
-    ];
 
-    for (const sel of selectors) {
-      $(sel).each((i, el) => {
-        const t = $(el).text().trim();
-        if (t.length > 40) {
-          text += t + " ";
-        }
+async function fetchTeluguNews() {
+
+  console.log(" Fetching ABP Telugu (Clean Version)");
+
+  let totalInserted = 0;
+
+  for (const feed of rssFeeds) {
+    try {
+
+     const response = await axios.get(feed.url, {
+  headers: {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept":
+      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+  },
+  timeout: 10000,
+});
+
+    
+      const fixedXML = response.data.replace(
+        /&(?!amp;|lt;|gt;|quot;|apos;)/g,
+        "&amp;"
+      );
+
+      const parser = new xml2js.Parser({
+        explicitArray: false,
+        tagNameProcessors: [xml2js.processors.stripPrefix],
       });
 
-      if (text.length > 300) break;
-    }
+      const data = await parser.parseStringPromise(fixedXML);
 
-    return text.trim();
+      let items = data?.rss?.channel?.item || [];
+      if (!Array.isArray(items)) items = [items];
 
-  } catch {
-    return "";
-  }
-}
+      for (const item of items.slice(0, 20)) {
 
+        if (!item?.link) continue;
 
+    
+        let finalCategory = detectFromURL(item.link);
 
-// Detect bad images
-function isBadImage(url) {
-  if (!url) return true;
-  const bad = ["logo", "icon", "sprite", "default"];
-  return bad.some((w) => url.toLowerCase().includes(w));
-}
+        if (finalCategory === "general") {
+          finalCategory =
+            await detectFromMetaAndBreadcrumb(item.link);
+        }
 
+        if (finalCategory === "general") {
+          finalCategory = feed.defaultCategory;
+        }
 
-
-// Extract image
-async function extractArticleImage(url) {
-  try {
-    const { data } = await axios.get(url);
-    const $ = cheerio.load(data);
-
-    const og = $('meta[property="og:image"]').attr("content");
-    if (og && !isBadImage(og)) return og;
-
-    return null;
-
-  } catch {
-    return null;
-  }
-}
-
-
-
-// MAIN FETCH
-async function fetchTeluguNews(category) {
-  const rssUrl = rssMap[category];
-  if (!rssUrl) return 0;
-
-  console.log("📡 Fetching ABP:", category);
-
-  const response = await axios.get(rssUrl);
-  const parser = new xml2js.Parser({
-    explicitArray: false,
-    tagNameProcessors: [xml2js.processors.stripPrefix],
-  });
-
-  const data = await parser.parseStringPromise(response.data);
-
-  const items = data?.rss?.channel?.item || [];
-  const list = Array.isArray(items)
-    ? items.slice(0, 10)
-    : [items];
-
-  let count = 0;
-
-  for (const item of list) {
-    try {
-      if (!item.link) continue;
-
-      // IMAGE
-      let imageUrl =
-        item.enclosure?.$?.url ||
-        item["media:content"]?.$?.url;
-
-      if (!imageUrl || isBadImage(imageUrl)) {
-        imageUrl = await extractArticleImage(item.link);
-      }
-
-      // FULL ARTICLE TEXT
-      let fullText = await extractFullArticle(item.link);
-
-      if (fullText.length < 150) {
-        fullText =
-          item["content:encoded"] ||
-          item.description ||
-          "";
-      }
-
-      const cleanDescription = cleanText(
-        fullText,
-        350
-      );
-
-      await News.updateOne(
-        { externalId: item.link },
-        {
-          $set: {
-            description: cleanDescription,
-            imageUrl:
-              imageUrl ||
-              "https://via.placeholder.com/300x200?text=News",
-          },
-          $setOnInsert: {
-            title: item.title,
-            link: item.link,
-            category,
-            language: "te",
-            source: "ABP Telugu",
+        await News.updateOne(
+          {
             externalId: item.link,
-            publishedAt: new Date(item.pubDate),
+            source: "ABP Telugu",
           },
-        },
-        { upsert: true }
-      );
+          {
+            $set: {
+              title: item.title || "No Title",
+              description: createSnippet(item.description || ""),
+              imageUrl: extractImage(item),
+              link: item.link,
+              category: finalCategory,
+              language: "te",
+              source: "ABP Telugu",
+              publishedAt: item.pubDate
+                ? new Date(item.pubDate)
+                : new Date(),
+            },
+          },
+          { upsert: true }
+        );
 
-      count++;
+        totalInserted++;
+      }
 
-    } catch {
-      console.log("⚠ Skip:", item.link);
+    } catch (err) {
+      console.log(" ABP feed error:", err.message);
     }
   }
 
-  console.log(`📰 ABP ${category} saved:`, count);
-  return count;
+  console.log(" ABP Processed:", totalInserted);
+  return totalInserted;
 }
 
 module.exports = { fetchTeluguNews };
